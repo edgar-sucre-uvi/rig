@@ -5,59 +5,61 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
+	"strings"
 )
 
-// InterfaceDef represents the extracted blueprint of a Go interface.
 type InterfaceDef struct {
 	Name          string
-	SourcePackage string
-	SourcePath    string
+	SourcePackage string // e.g., "domain"
+	SourcePath    string // Absolute path to source directory
 	Methods       []MethodDef
 }
 
-// MethodDef details a single method signature inside the interface.
 type MethodDef struct {
 	Name    string
 	Params  []FieldDef
 	Results []FieldDef
 }
 
-// FieldDef represents a parameter or return value.
 type FieldDef struct {
-	Name string // Can be blank for return types
+	Name string
 	Type string
 }
 
-// ParseInterface inspects a Go file and extracts a specific interface definition.
-func ParseInterface(filepath string, interfaceName string) (*InterfaceDef, error) {
+func ParseInterface(srcFile string, interfaceName string) (*InterfaceDef, error) {
 	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, filepath, nil, parser.ParseComments)
+	node, err := parser.ParseFile(fset, srcFile, nil, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse file: %w", err)
 	}
 
-	var targetInterface *InterfaceDef
+	absSrcPath, _ := filepath.Abs(srcFile)
+	sourcePackage := node.Name.Name
 
-	// Walk the AST to look for type declarations
+	targetInterface := &InterfaceDef{
+		Name:          interfaceName,
+		SourcePackage: sourcePackage,
+		SourcePath:    filepath.Dir(absSrcPath),
+	}
+
+	found := false
 	ast.Inspect(node, func(n ast.Node) bool {
 		typeSpec, ok := n.(*ast.TypeSpec)
 		if !ok || typeSpec.Name.Name != interfaceName {
-			return true // Keep looking
+			return true
 		}
 
 		interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
 		if !ok {
-			return true // Found the name, but it is not an interface
+			return true
 		}
 
-		targetInterface = &InterfaceDef{
-			Name: interfaceName,
-		}
+		found = true
 
-		// Extract methods
 		for _, method := range interfaceType.Methods.List {
 			if len(method.Names) == 0 {
-				continue // Skip embedded interfaces for simplicity now
+				continue
 			}
 
 			methodName := method.Names[0].Name
@@ -68,41 +70,33 @@ func ParseInterface(filepath string, interfaceName string) (*InterfaceDef, error
 
 			mDef := MethodDef{Name: methodName}
 
-			// Parse input parameters
 			if funcType.Params != nil {
 				mDef.Params = extractFields(funcType.Params.List)
 			}
-
-			// Parse return arguments
 			if funcType.Results != nil {
 				mDef.Results = extractFields(funcType.Results.List)
 			}
 
 			targetInterface.Methods = append(targetInterface.Methods, mDef)
 		}
-
-		return false // Found our target, stop inspecting
+		return false
 	})
 
-	if targetInterface == nil {
-		return nil, fmt.Errorf("interface %s not found in %s", interfaceName, filepath)
+	if !found {
+		return nil, fmt.Errorf("interface %s not found in %s", interfaceName, srcFile)
 	}
 
 	return targetInterface, nil
 }
 
-// extractFields converts AST fields into our simple IR definition.
 func extractFields(fields []*ast.Field) []FieldDef {
 	var result []FieldDef
 	for _, field := range fields {
-		// Formats types like *User, context.Context, or int into a string
 		typeName := exprToString(field.Type)
 
 		if len(field.Names) == 0 {
-			// Anonymous field (common in return values)
 			result = append(result, FieldDef{Type: typeName})
 		} else {
-			// Named fields (common in input parameters)
 			for _, name := range field.Names {
 				result = append(result, FieldDef{Name: name.Name, Type: typeName})
 			}
@@ -111,7 +105,6 @@ func extractFields(fields []*ast.Field) []FieldDef {
 	return result
 }
 
-// exprToString converts basic AST expressions into their code string equivalents.
 func exprToString(expr ast.Expr) string {
 	switch t := expr.(type) {
 	case *ast.Ident:
@@ -121,6 +114,40 @@ func exprToString(expr ast.Expr) string {
 	case *ast.SelectorExpr:
 		return exprToString(t.X) + "." + t.Sel.Name
 	default:
-		return fmt.Sprintf("%T", expr) // Fallback for complex types
+		return fmt.Sprintf("%T", expr)
+	}
+}
+
+// QualifyTypes dynamically runs through the interface fields and prefixes local
+// custom types with the source package name if we are generating code outside the source directory.
+func (i *InterfaceDef) QualifyTypes() {
+	primitives := map[string]bool{
+		"int": true, "int64": true, "string": true, "bool": true, "error": true,
+		"float64": true, "context.Context": true, "any": true,
+	}
+
+	qualify := func(t string) string {
+		hasPointer := strings.HasPrefix(t, "*")
+		pureType := strings.TrimPrefix(t, "*")
+
+		// If it's a known primitive or already has a package selector (like context.Context), skip it
+		if primitives[pureType] || strings.Contains(pureType, ".") {
+			return t
+		}
+
+		// Otherwise, forge the correct package path qualifier
+		if hasPointer {
+			return fmt.Sprintf("*%s.%s", i.SourcePackage, pureType)
+		}
+		return fmt.Sprintf("%s.%s", i.SourcePackage, pureType)
+	}
+
+	for mIdx, method := range i.Methods {
+		for pIdx, param := range method.Params {
+			i.Methods[mIdx].Params[pIdx].Type = qualify(param.Type)
+		}
+		for rIdx, res := range method.Results {
+			i.Methods[mIdx].Results[rIdx].Type = qualify(res.Type)
+		}
 	}
 }
